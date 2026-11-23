@@ -1,3 +1,4 @@
+#include "nfkd_table.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -706,24 +707,48 @@ static Str long_date(Str d) {
 }
 
 static Str slugify_raw(Str text) {
-  bool ascii = true;
-  for (uint32_t i = 0; i < text.n; i++) if ((uint8_t)text.p[i] >= 128) { ascii = false; break; }
-  if (!ascii) {
-    char *out = (char *)arena_alloc(128);
-    uint32_t len = js_slugify(text.p, text.n, out);
-    return str_lit(out, len);
-  }
   char *out = (char *)arena_alloc(64);
   uint32_t on = 0; bool gap = false;
-  for (uint32_t i = 0; i < text.n; i++) {
-    uint8_t c = (uint8_t)text.p[i];
-    int keep = -1;
-    if (c >= 'A' && c <= 'Z') keep = c + 32;
-    else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) keep = c;
-    if (keep == -1) { if (on > 0) gap = true; continue; }
-    if (gap) { if (on >= 63) break; out[on++] = '-'; gap = false; }
-    out[on++] = (char)keep;
-    if (on >= 64) break;
+  uint32_t i = 0;
+  while (i < text.n) {
+    uint8_t b0 = (uint8_t)text.p[i];
+    if (b0 < 128) {
+      i++;
+      int keep = -1;
+      if (b0 >= 'A' && b0 <= 'Z') keep = b0 + 32;
+      else if ((b0 >= 'a' && b0 <= 'z') || (b0 >= '0' && b0 <= '9')) keep = b0;
+      if (keep == -1) { if (on > 0) gap = true; continue; }
+      if (gap) { if (on >= 63) break; out[on++] = '-'; gap = false; }
+      out[on++] = (char)keep;
+      if (on >= 64) break;
+    } else {
+      uint32_t cp = 0;
+      if ((b0 & 0xE0) == 0xC0 && i + 1 < text.n) {
+        cp = ((uint32_t)(b0 & 0x1F) << 6) | ((uint8_t)text.p[i + 1] & 0x3F);
+        i += 2;
+      } else if ((b0 & 0xF0) == 0xE0 && i + 2 < text.n) {
+        cp = ((uint32_t)(b0 & 0x0F) << 12) | (((uint8_t)text.p[i + 1] & 0x3F) << 6) | ((uint8_t)text.p[i + 2] & 0x3F);
+        i += 3;
+      } else if ((b0 & 0xF8) == 0xF0 && i + 3 < text.n) {
+        cp = ((uint32_t)(b0 & 0x07) << 18) | (((uint8_t)text.p[i + 1] & 0x3F) << 12) | (((uint8_t)text.p[i + 2] & 0x3F) << 6) | ((uint8_t)text.p[i + 3] & 0x3F);
+        i += 4;
+      } else { i++; continue; }
+
+      uint32_t v = nfkd_lookup(cp);
+      uint32_t len = v & 0xFF;
+      if (len == 0xFF) {
+        char *fb = (char *)arena_alloc(128);
+        uint32_t flen = js_slugify(text.p, text.n, fb);
+        return str_lit(fb, flen);
+      }
+      if (len == 0xFE) continue;
+      if (len == 0) { if (on > 0) gap = true; continue; }
+      if (gap) { if (on >= 63) break; out[on++] = '-'; gap = false; }
+      for (uint32_t k = 0; k < len && on < 64; k++) {
+        out[on++] = (char)((v >> (8 * (k + 1))) & 0xFF);
+      }
+      if (on >= 64) break;
+    }
   }
   while (on > 0 && out[on - 1] == '-') on--;
   return on == 0 ? S("untitled") : str_lit(out, on);

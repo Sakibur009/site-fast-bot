@@ -1,5 +1,5 @@
 // Fast pure-JS drop-in for makefun-site 1.0.0
-// v3: Pre-JSON-Escaped Single-Pass Markdown + Constant-Folded JIT + Direct Buffer Arena
+// v5: Fast-path inline scanner + direct slice emissions + constant-folded JIT
 
 const REPORT_FILE = 'build-report.txt';
 const RESERVED = ['posts', 'tags', 'page'];
@@ -10,8 +10,6 @@ const MONTHS = [
 
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
-// ---------------------------------------------------------------- text & JSON-escape utils
-
 const HTML_SPEC = new Uint8Array(128);
 HTML_SPEC[38] = 1; // &
 HTML_SPEC[60] = 1; // <
@@ -21,17 +19,17 @@ HTML_SPEC[39] = 1; // '
 
 const HTML_JSON_SPEC = new Uint8Array(128);
 for (let i = 0; i < 32; i++) HTML_JSON_SPEC[i] = 1;
-HTML_JSON_SPEC[34] = 1; // "
-HTML_JSON_SPEC[38] = 1; // &
-HTML_JSON_SPEC[39] = 1; // '
-HTML_JSON_SPEC[60] = 1; // <
-HTML_JSON_SPEC[62] = 1; // >
-HTML_JSON_SPEC[92] = 1; // \
+HTML_JSON_SPEC[34] = 1;
+HTML_JSON_SPEC[38] = 1;
+HTML_JSON_SPEC[39] = 1;
+HTML_JSON_SPEC[60] = 1;
+HTML_JSON_SPEC[62] = 1;
+HTML_JSON_SPEC[92] = 1;
 
 const JSON_SPEC = new Uint8Array(128);
 for (let i = 0; i < 32; i++) JSON_SPEC[i] = 1;
-JSON_SPEC[34] = 1; // "
-JSON_SPEC[92] = 1; // \
+JSON_SPEC[34] = 1;
+JSON_SPEC[92] = 1;
 
 const HEX = '0123456789abcdef';
 function ctrlEsc(c) {
@@ -187,13 +185,12 @@ function slugifyRaw(text) {
 }
 
 function uniqueSlug(slug, taken) {
-  let out = slug;
-  if (!taken.has(out)) {
-    taken.add(out);
-    return out;
+  if (!taken.has(slug)) {
+    taken.add(slug);
+    return slug;
   }
   for (let n = 2; ; n++) {
-    out = slug + '-' + n;
+    const out = slug + '-' + n;
     if (!taken.has(out)) {
       taken.add(out);
       return out;
@@ -337,14 +334,13 @@ function fmValueOf(key, raw) {
 
 function parseFrontMatter(text) {
   const len = text.length;
-  let nl = text.indexOf('\n');
-  const firstEnd = nl === -1 ? len : nl;
-  if (firstEnd !== 3 || text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45) {
+  if (len < 4 || text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45) {
     return { error: 'no front matter' };
   }
-  if (nl === -1) return { error: 'the front matter is not closed' };
+  const nl = text.indexOf('\n');
+  if (nl !== 3) return { error: nl === -1 ? 'the front matter is not closed' : 'no front matter' };
 
-  let pos = nl + 1;
+  let pos = 4;
   let closePos = -1;
   let bodyStart = len;
   while (pos <= len) {
@@ -361,7 +357,7 @@ function parseFrontMatter(text) {
   if (closePos === -1) return { error: 'the front matter is not closed' };
 
   const data = {};
-  pos = nl + 1;
+  pos = 4;
   let lineNum = 1;
   while (pos < closePos) {
     lineNum++;
@@ -393,7 +389,7 @@ function parseFrontMatter(text) {
   return { data, body: bodyStart >= len ? '' : text.slice(bodyStart) };
 }
 
-// ---------------------------------------------------------------- markdown (single-pass, raw & pre-JSON)
+// ---------------------------------------------------------------- markdown (v5 fast path)
 
 const ESCAPABLE = new Uint8Array(128);
 for (const ch of '\\`*_[]()#+-.!>') ESCAPABLE[ch.charCodeAt(0)] = 1;
@@ -474,9 +470,25 @@ function hasWhitespace(s, start, end) {
 
 function inlineSlice(s, start, end, linkFn, jsonEsc) {
   const spec = jsonEsc ? INLINE_JSON_SPEC : INLINE_SPEC;
-  let out = '';
-  let last = start;
   let i = start;
+  for (; i < end; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 128) {
+      if (spec[c]) break;
+    } else if (jsonEsc && c >= 0xd800 && c <= 0xdfff) {
+      if (c <= 0xdbff && i + 1 < end) {
+        const c2 = s.charCodeAt(i + 1);
+        if (c2 >= 0xdc00 && c2 <= 0xdfff) { i++; continue; }
+      }
+      break;
+    }
+  }
+  if (i === end) return s.slice(start, end);
+
+  const parts = [];
+  if (i > start) parts.push(s.slice(start, i));
+  let last = i;
+
   while (i < end) {
     const c = s.charCodeAt(i);
     if (c < 128) {
@@ -486,35 +498,38 @@ function inlineSlice(s, start, end, linkFn, jsonEsc) {
         const c2 = s.charCodeAt(i + 1);
         if (c2 >= 0xdc00 && c2 <= 0xdfff) { i += 2; continue; }
       }
-      if (i > last) out += s.slice(last, i);
-      out += '\\u' + c.toString(16).padStart(4, '0');
-      i++; last = i;
+      if (i > last) parts.push(s.slice(last, i));
+      parts.push('\\u' + c.toString(16).padStart(4, '0'));
+      i++;
+      last = i;
       continue;
     } else {
       i++;
       continue;
     }
-    if (i > last) out += s.slice(last, i);
-    if (c === 38) { out += '&amp;'; i++; last = i; continue; }
-    if (c === 60) { out += '&lt;'; i++; last = i; continue; }
-    if (c === 62) { out += '&gt;'; i++; last = i; continue; }
-    if (c === 34) { out += '&quot;'; i++; last = i; continue; }
-    if (c === 39) { out += '&#39;'; i++; last = i; continue; }
-    if (c < 32) { out += ctrlEsc(c); i++; last = i; continue; }
+
+    if (i > last) parts.push(s.slice(last, i));
+
+    if (c === 38) { parts.push('&amp;'); i++; last = i; continue; }
+    if (c === 60) { parts.push('&lt;'); i++; last = i; continue; }
+    if (c === 62) { parts.push('&gt;'); i++; last = i; continue; }
+    if (c === 34) { parts.push('&quot;'); i++; last = i; continue; }
+    if (c === 39) { parts.push('&#39;'); i++; last = i; continue; }
+    if (c < 32) { parts.push(ctrlEsc(c)); i++; last = i; continue; }
 
     if (c === 92) {
       if (i + 1 < end) {
         const n = s.charCodeAt(i + 1);
         if (n < 128 && ESCAPABLE[n]) {
-          if (n === 62) out += '&gt;';
-          else if (n === 92) out += jsonEsc ? '\\\\' : '\\';
-          else out += s[i + 1];
+          if (n === 62) parts.push('&gt;');
+          else if (n === 92) parts.push(jsonEsc ? '\\\\' : '\\');
+          else parts.push(s[i + 1]);
           i += 2;
           last = i;
           continue;
         }
       }
-      out += jsonEsc ? '\\\\' : '\\';
+      parts.push(jsonEsc ? '\\\\' : '\\');
       i++;
       last = i;
       continue;
@@ -523,10 +538,11 @@ function inlineSlice(s, start, end, linkFn, jsonEsc) {
     if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < end && j > i + 1) {
-        out += '<code>' + (jsonEsc ? escapeHtmlJson(s.slice(i + 1, j)) : escapeHtml(s.slice(i + 1, j))) + '</code>';
+        const codeSlice = s.slice(i + 1, j);
+        parts.push('<code>', jsonEsc ? escapeHtmlJson(codeSlice) : escapeHtml(codeSlice), '</code>');
         i = j + 1;
       } else {
-        out += '`';
+        parts.push('`');
         i++;
       }
       last = i;
@@ -537,19 +553,19 @@ function inlineSlice(s, start, end, linkFn, jsonEsc) {
       if (i + 1 < end && s.charCodeAt(i + 1) === 42) {
         const j = findUnescapedDoubleStar(s, i + 2, end);
         if (j > i + 2) {
-          out += '<strong>' + inlineSlice(s, i + 2, j, linkFn, jsonEsc) + '</strong>';
+          parts.push('<strong>', inlineSlice(s, i + 2, j, linkFn, jsonEsc), '</strong>');
           i = j + 2;
         } else {
-          out += '**';
+          parts.push('**');
           i += 2;
         }
       } else {
         const j = findSingleStar(s, i + 1, end);
         if (j > i + 1) {
-          out += '<em>' + inlineSlice(s, i + 1, j, linkFn, jsonEsc) + '</em>';
+          parts.push('<em>', inlineSlice(s, i + 1, j, linkFn, jsonEsc), '</em>');
           i = j + 1;
         } else {
-          out += '*';
+          parts.push('*');
           i++;
         }
       }
@@ -567,19 +583,19 @@ function inlineSlice(s, start, end, linkFn, jsonEsc) {
       if (m !== -1 && m > k + 2 && !hasWhitespace(s, k + 2, m)) {
         const target = s.slice(k + 2, m);
         const href = jsonEsc ? escapeHtmlJson(linkFn(target)) : escapeHtml(linkFn(target));
-        out += (jsonEsc ? '<a href=\\"' : '<a href="') + href + (jsonEsc ? '\\">' : '">') + inlineSlice(s, i + 1, k, linkFn, jsonEsc) + '</a>';
+        parts.push(jsonEsc ? '<a href=\\"' : '<a href="', href, jsonEsc ? '\\">' : '">', inlineSlice(s, i + 1, k, linkFn, jsonEsc), '</a>');
         i = m + 1;
       } else {
-        out += '[';
+        parts.push('[');
         i++;
       }
       last = i;
       continue;
     }
   }
-  if (last === start) return s.slice(start, end);
-  if (last < end) out += s.slice(last, end);
-  return out;
+
+  if (last < end) parts.push(s.slice(last, end));
+  return parts.join('');
 }
 
 function isBlankLine(src, start, end) {
@@ -593,7 +609,7 @@ function isBlankLine(src, start, end) {
 function trimLineSlice(src, start, end) {
   while (start < end && (src.charCodeAt(start) === 32 || src.charCodeAt(start) === 9)) start++;
   while (end > start && (src.charCodeAt(end - 1) === 32 || src.charCodeAt(end - 1) === 9)) end--;
-  return src.slice(start, end);
+  return start === end ? '' : src.slice(start, end);
 }
 
 function matchFenceOpen(src, start, end) {
@@ -687,16 +703,15 @@ function renderMarkdown(src, linkFn, slugCache, jsonEsc) {
   const ids = new Set();
   const toc = [];
   let excerpt = null;
-  let html = '';
+  const out = [];
   const NL = jsonEsc ? '\\n' : '\n';
   const Q = jsonEsc ? '\\"' : '"';
 
   let pos = 0;
-  while (pos <= len) {
-    if (pos === len && len === 0) break;
+  while (pos < len) {
     let nl = src.indexOf('\n', pos);
     let end = nl === -1 ? len : nl;
-    let nextPos = nl === -1 ? len + 1 : nl + 1;
+    let nextPos = nl === -1 ? len : nl + 1;
 
     if (isBlankLine(src, pos, end)) {
       pos = nextPos;
@@ -708,20 +723,21 @@ function renderMarkdown(src, linkFn, slugCache, jsonEsc) {
     if (c0 === 96) {
       const lang = matchFenceOpen(src, pos, end);
       if (lang !== null) {
-        html += lang === '' ? '<pre><code>' : '<pre><code class=' + Q + 'language-' + lang + Q + '>';
+        out.push(lang === '' ? '<pre><code>' : '<pre><code class=' + Q + 'language-' + lang + Q + '>');
         pos = nextPos;
-        while (pos <= len) {
+        while (pos < len) {
           nl = src.indexOf('\n', pos);
           end = nl === -1 ? len : nl;
-          nextPos = nl === -1 ? len + 1 : nl + 1;
+          nextPos = nl === -1 ? len : nl + 1;
           if (isFenceClose(src, pos, end)) {
             pos = nextPos;
             break;
           }
-          html += (jsonEsc ? escapeHtmlJson(src.slice(pos, end)) : escapeHtml(src.slice(pos, end))) + NL;
+          const line = src.slice(pos, end);
+          out.push(jsonEsc ? escapeHtmlJson(line) : escapeHtml(line), NL);
           pos = nextPos;
         }
-        html += '</code></pre>' + NL;
+        out.push('</code></pre>', NL);
         continue;
       }
     }
@@ -737,7 +753,7 @@ function renderMarkdown(src, linkFn, slugCache, jsonEsc) {
         }
         const id = uniqueSlug(baseSlug, ids);
         const hHtml = inlineSlice(src, _hStart, _hEnd, linkFn, jsonEsc);
-        html += '<h' + depth + ' id=' + Q + id + Q + '>' + hHtml + '</h' + depth + '>' + NL;
+        out.push('<h' + depth + ' id=' + Q + id + Q + '>', hHtml, '</h' + depth + '>', NL);
         if (depth === 2 || depth === 3) toc.push({ level: depth, id, html: hHtml });
         pos = nextPos;
         continue;
@@ -745,53 +761,57 @@ function renderMarkdown(src, linkFn, slugCache, jsonEsc) {
     }
 
     if ((c0 === 45 || c0 === 42) && isHr(src, pos, end)) {
-      html += '<hr>' + NL;
+      out.push('<hr>', NL);
       pos = nextPos;
       continue;
     }
 
     if (c0 === 62) {
-      let qText = '';
-      while (pos <= len) {
+      const qLines = [];
+      while (pos < len) {
         nl = src.indexOf('\n', pos);
         end = nl === -1 ? len : nl;
-        nextPos = nl === -1 ? len + 1 : nl + 1;
+        nextPos = nl === -1 ? len : nl + 1;
         if (pos >= end || src.charCodeAt(pos) !== 62) break;
         let qStart = pos + 1;
         if (qStart < end && src.charCodeAt(qStart) === 32) qStart++;
         const trimmed = trimLineSlice(src, qStart, end);
-        if (trimmed !== '') qText = qText === '' ? trimmed : qText + '\n' + trimmed;
+        if (trimmed !== '') qLines.push(trimmed);
         pos = nextPos;
       }
-      if (qText === '') {
-        html += '<blockquote>' + NL + '</blockquote>' + NL;
+      if (qLines.length === 0) {
+        out.push('<blockquote>', NL, '</blockquote>', NL);
       } else {
-        html += '<blockquote>' + NL + '<p>' + inlineSlice(qText, 0, qText.length, linkFn, jsonEsc) + '</p>' + NL + '</blockquote>' + NL;
+        const qText = qLines.join('\n');
+        out.push('<blockquote>', NL, '<p>', inlineSlice(qText, 0, qText.length, linkFn, jsonEsc), '</p>', NL, '</blockquote>', NL);
       }
       continue;
     }
 
     if ((c0 === 45 || c0 === 42) && pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
-      html += '<ul>' + NL;
-      let curItem = trimLineSlice(src, pos + 2, end);
+      out.push('<ul>', NL);
+      const itemLines = [trimLineSlice(src, pos + 2, end)];
       pos = nextPos;
-      while (pos <= len) {
+      while (pos < len) {
         nl = src.indexOf('\n', pos);
         end = nl === -1 ? len : nl;
-        nextPos = nl === -1 ? len + 1 : nl + 1;
-        const ch = pos < end ? src.charCodeAt(pos) : 0;
+        nextPos = nl === -1 ? len : nl + 1;
+        const ch = src.charCodeAt(pos);
         if ((ch === 45 || ch === 42) && pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
-          html += '<li>' + inlineSlice(curItem, 0, curItem.length, linkFn, jsonEsc) + '</li>' + NL;
-          curItem = trimLineSlice(src, pos + 2, end);
+          const itemStr = itemLines.join('\n');
+          out.push('<li>', inlineSlice(itemStr, 0, itemStr.length, linkFn, jsonEsc), '</li>', NL);
+          itemLines.length = 0;
+          itemLines.push(trimLineSlice(src, pos + 2, end));
           pos = nextPos;
         } else if (isContinued(src, pos, end)) {
-          curItem += '\n' + trimLineSlice(src, pos, end);
+          itemLines.push(trimLineSlice(src, pos, end));
           pos = nextPos;
         } else {
           break;
         }
       }
-      html += '<li>' + inlineSlice(curItem, 0, curItem.length, linkFn, jsonEsc) + '</li>' + NL + '</ul>' + NL;
+      const lastItemStr = itemLines.join('\n');
+      out.push('<li>', inlineSlice(lastItemStr, 0, lastItemStr.length, linkFn, jsonEsc), '</li>', NL, '</ul>', NL);
       continue;
     }
 
@@ -799,36 +819,39 @@ function renderMarkdown(src, linkFn, slugCache, jsonEsc) {
       const restStart = isOrderedStart(src, pos, end);
       if (restStart !== -1) {
         const startNum = Number(src.slice(pos, restStart - 2));
-        html += startNum !== 1 ? '<ol start=' + Q + startNum + Q + '>' + NL : '<ol>' + NL;
-        let curItem = trimLineSlice(src, restStart, end);
+        out.push(startNum !== 1 ? '<ol start=' + Q + startNum + Q + '>' + NL : '<ol>' + NL);
+        const itemLines = [trimLineSlice(src, restStart, end)];
         pos = nextPos;
-        while (pos <= len) {
+        while (pos < len) {
           nl = src.indexOf('\n', pos);
           end = nl === -1 ? len : nl;
-          nextPos = nl === -1 ? len + 1 : nl + 1;
-          const rStart = pos < end && src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57 ? isOrderedStart(src, pos, end) : -1;
+          nextPos = nl === -1 ? len : nl + 1;
+          const rStart = src.charCodeAt(pos) >= 48 && src.charCodeAt(pos) <= 57 ? isOrderedStart(src, pos, end) : -1;
           if (rStart !== -1) {
-            html += '<li>' + inlineSlice(curItem, 0, curItem.length, linkFn, jsonEsc) + '</li>' + NL;
-            curItem = trimLineSlice(src, rStart, end);
+            const itemStr = itemLines.join('\n');
+            out.push('<li>', inlineSlice(itemStr, 0, itemStr.length, linkFn, jsonEsc), '</li>', NL);
+            itemLines.length = 0;
+            itemLines.push(trimLineSlice(src, rStart, end));
             pos = nextPos;
           } else if (isContinued(src, pos, end)) {
-            curItem += '\n' + trimLineSlice(src, pos, end);
+            itemLines.push(trimLineSlice(src, pos, end));
             pos = nextPos;
           } else {
             break;
           }
         }
-        html += '<li>' + inlineSlice(curItem, 0, curItem.length, linkFn, jsonEsc) + '</li>' + NL + '</ol>' + NL;
+        const lastItemStr = itemLines.join('\n');
+        out.push('<li>', inlineSlice(lastItemStr, 0, lastItemStr.length, linkFn, jsonEsc), '</li>', NL, '</ol>', NL);
         continue;
       }
     }
 
-    let pText = trimLineSlice(src, pos, end);
+    const pLines = [trimLineSlice(src, pos, end)];
     pos = nextPos;
-    while (pos <= len) {
+    while (pos < len) {
       nl = src.indexOf('\n', pos);
       end = nl === -1 ? len : nl;
-      nextPos = nl === -1 ? len + 1 : nl + 1;
+      nextPos = nl === -1 ? len : nl + 1;
       if (
         isBlankLine(src, pos, end) ||
         (src.charCodeAt(pos) === 96 && matchFenceOpen(src, pos, end) !== null) ||
@@ -837,15 +860,16 @@ function renderMarkdown(src, linkFn, slugCache, jsonEsc) {
       ) {
         break;
       }
-      pText += '\n' + trimLineSlice(src, pos, end);
+      pLines.push(trimLineSlice(src, pos, end));
       pos = nextPos;
     }
+    const pText = pLines.join('\n');
     const pHtml = inlineSlice(pText, 0, pText.length, linkFn, jsonEsc);
     if (excerpt === null) excerpt = pHtml;
-    html += '<p>' + pHtml + '</p>' + NL;
+    out.push('<p>', pHtml, '</p>', NL);
   }
 
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: out.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates (Constant-Folded JIT)
@@ -1164,7 +1188,6 @@ function compileTemplate(nodes, templates, constVars, jsonMode, preEscMd) {
     return '_P(' + base + ',_L[' + pIdx + '])';
   }
 
-  // pendingText is ALREADY in final representation (escaped for JSON if jsonMode)
   let pendingText = '';
   function flushText() {
     if (pendingText !== '') {
@@ -1290,7 +1313,6 @@ function buildCore(input, writeStr) {
   while (bEnd > 0 && base.charCodeAt(bEnd - 1) === 47) bEnd--;
   if (bEnd !== base.length) base = base.slice(0, bEnd);
 
-  // 1. Read & sort sources
   const files = input.files.slice().sort((x, y) => byCodeUnits(x.path, y.path));
   const sources = [];
   const statics = [];
@@ -1309,7 +1331,6 @@ function buildCore(input, writeStr) {
     }
   }
 
-  // 2. Front matter
   const kept = [];
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
@@ -1348,7 +1369,6 @@ function buildCore(input, writeStr) {
     kept.push(s);
   }
 
-  // 3. Permalinks
   const slugCache = new Map();
   const slugify = (text) => {
     let v = slugCache.get(text);
@@ -1376,7 +1396,6 @@ function buildCore(input, writeStr) {
     bySource.set(s.path, s);
   }
 
-  // 4. Markdown
   const broken = new Set();
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
@@ -1402,7 +1421,6 @@ function buildCore(input, writeStr) {
     s.excerpt = md.excerpt;
   }
 
-  // 5. Collections
   const posts = [];
   for (let i = 0; i < kept.length; i++) {
     if (kept[i].post) posts.push(kept[i]);
@@ -1413,7 +1431,6 @@ function buildCore(input, writeStr) {
     posts[k].older = k === posts.length - 1 ? null : posts[k + 1];
   }
 
-  // 6. Tags
   const bySlug = new Map();
   for (let i = 0; i < posts.length; i++) {
     const p = posts[i];
@@ -1456,7 +1473,6 @@ function buildCore(input, writeStr) {
   }
   const tagsList = Array.from(bySlug.values()).sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
-  // 7. Build site constants & compile templates
   const cardOf = (s) => {
     const tr = s.tagRefs;
     const tOut = new Array(tr.length);
@@ -1519,15 +1535,14 @@ function buildCore(input, writeStr) {
   const outObj = jsonMode ? null : {};
   const written = jsonMode ? new Set() : null;
   let firstKey = true;
-  if (jsonMode) writeStr('{');
 
   function emitFile(path, content, alreadyJson) {
     if (jsonMode) {
       written.add(path);
-      writeStr((firstKey ? '"' : ',"') + escapeJson(path) + '":"');
+      const prefix = firstKey ? '{"' : ',"';
+      const val = alreadyJson ? content : escapeJson(content);
+      writeStr(prefix + escapeJson(path) + '":"' + val + '"');
       firstKey = false;
-      writeStr(alreadyJson ? content : escapeJson(content));
-      writeStr('"');
     } else {
       outObj[path] = content;
     }

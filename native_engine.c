@@ -2306,9 +2306,9 @@ static int run_files_fd(long fd, const char *out_path) {
   if (mapped < 0) return 0;
 
   // Separate 64MB demand-paged output buffer so heap_ptr can reset every case
-  long obuf = sys6(SYS_mmap, 0, 64L * 1024 * 1024, 3 /*PROT_READ|PROT_WRITE*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
+  long obuf = sys6(SYS_mmap, 0, 24L * 1024 * 1024, 3 /*PROT_READ|PROT_WRITE*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
   if (obuf < 0) return 0;
-  Buf g_out = { (char *)obuf, 0, 64U * 1024 * 1024 };
+  Buf g_out = { (char *)obuf, 0, 24U * 1024 * 1024 };
   buf_putc(&g_out, '[');
 
   JP jp = { (const char *)mapped, (uint32_t)sz, 0 };

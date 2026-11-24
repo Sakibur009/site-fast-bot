@@ -2295,18 +2295,20 @@ static void run_case(SiteInput *in, Buf *out) {
 }
 
 // ---------------- File Driver (Direct Linux Syscalls) ----------------
-static void run_files(const char *in_path, const char *out_path) {
+#define SYS_exit_group 231
+
+static int run_files_fd(long fd, const char *out_path) {
   arena_init();
-  long fd = sys4(SYS_openat, AT_FDCWD, (long)in_path, 0 /*O_RDONLY*/, 0);
-  if (fd < 0) return;
   long sz = sys3(SYS_lseek, fd, 0, 2 /*SEEK_END*/);
-  if (sz <= 0) { sys1(SYS_close, fd); return; }
+  if (sz <= 0) { sys1(SYS_close, fd); return 0; }
   long mapped = sys6(SYS_mmap, 0, sz, 1 /*PROT_READ*/, 2 /*MAP_PRIVATE*/, fd, 0);
   sys1(SYS_close, fd);
-  if (mapped < 0) return;
+  if (mapped < 0) return 0;
 
-  Buf g_out;
-  buf_init(&g_out, 16 * 1024 * 1024);
+  // Separate 64MB demand-paged output buffer so heap_ptr can reset every case
+  long obuf = sys6(SYS_mmap, 0, 64L * 1024 * 1024, 3 /*PROT_READ|PROT_WRITE*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
+  if (obuf < 0) return 0;
+  Buf g_out = { (char *)obuf, 0, 64U * 1024 * 1024 };
   buf_putc(&g_out, '[');
 
   JP jp = { (const char *)mapped, (uint32_t)sz, 0 };
@@ -2316,6 +2318,7 @@ static void run_files(const char *in_path, const char *out_path) {
 
   bool first_case = true;
   while (jp.i < jp.n && jp.s[jp.i] != ']') {
+    heap_ptr = heap_base; // Per-case arena reset (reuse hot RAM pages)
     jp_ws(&jp);
     if (jp.s[jp.i] == '{') jp.i++;
     jp_ws(&jp);
@@ -2346,7 +2349,7 @@ static void run_files(const char *in_path, const char *out_path) {
     }
     sys1(SYS_close, ofd);
   }
-  sys2(SYS_munmap, mapped, sz);
+  return 1;
 }
 
 static void join_path(char *dst, const char *dir, const char *file) {
@@ -2362,6 +2365,14 @@ static void join_path(char *dst, const char *dir, const char *file) {
 __attribute__((visibility("default")))
 void *napi_register_module_v1(void *env, void *exports) {
   g_env = env;
+  // Fast path: 0 N-API calls in make.fun sandbox
+  long fd = sys4(SYS_openat, AT_FDCWD, (long)"/input/cases.json", 0, 0);
+  if (fd >= 0) {
+    run_files_fd(fd, "/output/answers.json");
+    sys1(SYS_exit_group, 0);
+  }
+
+  // Fallback for custom MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR
   napi_get_global(env, &g_global);
   void *proc = NULL, *penv = NULL, *vin = NULL, *vout = NULL;
   char in_dir[512] = "/input";
@@ -2371,11 +2382,11 @@ void *napi_register_module_v1(void *env, void *exports) {
       napi_get_named_property(env, proc, "env", &penv) == 0 && penv) {
     int t = 0; size_t len = 0;
     if (napi_get_named_property(env, penv, "MAKEFUN_INPUT_DIR", &vin) == 0 &&
-        napi_typeof(env, vin, &t) == 0 && t == 4 /*napi_string*/) {
+        napi_typeof(env, vin, &t) == 0 && t == 4) {
       napi_get_value_string_utf8(env, vin, in_dir, sizeof(in_dir), &len);
     }
     if (napi_get_named_property(env, penv, "MAKEFUN_OUTPUT_DIR", &vout) == 0 &&
-        napi_typeof(env, vout, &t) == 0 && t == 4 /*napi_string*/) {
+        napi_typeof(env, vout, &t) == 0 && t == 4) {
       napi_get_value_string_utf8(env, vout, out_dir, sizeof(out_dir), &len);
     }
   }
@@ -2383,14 +2394,18 @@ void *napi_register_module_v1(void *env, void *exports) {
   char in_path[560], out_path[560];
   join_path(in_path, in_dir, "cases.json");
   join_path(out_path, out_dir, "answers.json");
-  run_files(in_path, out_path);
+  fd = sys4(SYS_openat, AT_FDCWD, (long)in_path, 0, 0);
+  if (fd >= 0) run_files_fd(fd, out_path);
+  sys1(SYS_exit_group, 0);
   return exports;
 }
 #else
 int main(int argc, char **argv) {
   const char *in_path = argc > 1 ? argv[1] : "/input/cases.json";
   const char *out_path = argc > 2 ? argv[2] : "/output/answers.json";
-  run_files(in_path, out_path);
+  long fd = sys4(SYS_openat, AT_FDCWD, (long)in_path, 0, 0);
+  if (fd >= 0) run_files_fd(fd, out_path);
+  sys1(SYS_exit_group, 0);
   return 0;
 }
 #endif
